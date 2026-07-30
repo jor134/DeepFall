@@ -398,7 +398,8 @@ const G={
   entry:{auto:true,t:0}, ascend:{t:0},
   remotes:{}, ai:[], shots:[], fx:[],
   depleted:new Set(), looted:new Set(),
-  planet:null, gate:null, derelicts:[], asteroids:null,
+  planet:null, moon:null, bodies:[], surfBody:null,
+  sunDir:null, sunPos:null, gate:null, derelicts:[], asteroids:null,
   storageOK:false
 };
 const COLORS=[0xffc043,0x5ce1d0,0xff5f3d,0xb58cff,0x7dff8e,0xff8fd0];
@@ -542,16 +543,51 @@ function buildSector(seed){
   sg.setAttribute('color',new T.Float32BufferAttribute(sc,3));
   R.SPACE.add(new T.Points(sg,new T.PointsMaterial({size:7,vertexColors:true,sizeAttenuation:true})));
 
-  // planet — hue seeded, so each sector reads distinct at a glance
+  // ---- the sun ----
+  // Its direction also drives LIGHT, which every cel material shares by
+  // reference, so shading across the whole sector agrees with where the sun
+  // visibly is instead of being an arbitrary constant.
+  const sa=rng()*PI*2, se=(rng()-.35)*1.1;
+  const sunDir=new T.Vector3(Math.cos(sa)*Math.cos(se),Math.sin(se),Math.sin(sa)*Math.cos(se)).normalize();
+  LIGHT.copy(sunDir);
+  G.sunDir=sunDir.clone();
+  const sunPos=sunDir.clone().multiplyScalar(2950);
+  const sunCore=new T.Mesh(new T.SphereGeometry(150,20,16),
+    new T.MeshBasicMaterial({color:0xfff3d0}));
+  sunCore.position.copy(sunPos); R.SPACE.add(sunCore);
+  for(const [rr,op,col] of [[230,.34,0xffd98a],[330,.17,0xffb457],[470,.07,0xff8a3d]]){
+    const gl=new T.Mesh(new T.SphereGeometry(rr,18,14),
+      new T.MeshBasicMaterial({color:col,transparent:true,opacity:op,
+        side:T.BackSide,depthWrite:false,blending:T.AdditiveBlending}));
+    gl.position.copy(sunPos); R.SPACE.add(gl);
+  }
+  G.sunPos=sunPos.clone();
+
+  // ---- worlds ----
+  G.bodies=[];
+  function makeBody(id,pos,rad,hue,bseed,opt){
+    const col=new T.Color().setHSL(hue,opt.sat||.5,opt.lum||.5);
+    const m=cel(new T.SphereGeometry(rad,opt.seg||26,Math.round((opt.seg||26)*.78)),
+      col.getHex(),{bands:4,thick:rad*.0064});
+    m.position.copy(pos); R.SPACE.add(m);
+    const halo=new T.Mesh(new T.SphereGeometry(rad*1.08,20,15),
+      new T.MeshBasicMaterial({color:col.getHex(),transparent:true,
+        opacity:opt.halo===undefined?.14:opt.halo,side:T.BackSide,depthWrite:false}));
+    halo.position.copy(pos); R.SPACE.add(halo);
+    const b={id,obj:m,halo,pos:pos.clone(),r:rad,hue,seed:bseed,
+      relief:opt.relief||1, alienN:opt.alienN||13, xen:opt.xen||.2,
+      spin:(rng()-.5)*.06, name:opt.name||id};
+    G.bodies.push(b);
+    return b;
+  }
   const hue=rng();
-  const pcol=new T.Color().setHSL(hue,.5,.5);
-  const planet=cel(new T.SphereGeometry(220,26,20),pcol.getHex(),{bands:4,thick:1.4});
-  planet.position.set(0,-120,-620);
-  R.SPACE.add(planet);
-  const halo=new T.Mesh(new T.SphereGeometry(238,22,16),
-    new T.MeshBasicMaterial({color:pcol.getHex(),transparent:true,opacity:.14,side:T.BackSide}));
-  halo.position.copy(planet.position); R.SPACE.add(halo);
-  G.planet={obj:planet,pos:planet.position.clone(),r:220,hue:hue,seed:seed^0x9e37};
+  G.planet=makeBody('P',new T.Vector3(0,-120,-620),220,hue,(seed^0x9e37)>>>0,
+    {relief:1, alienN:13, xen:.2, name:'PLANET'});
+  // A cratered moon, offset from the planet and nestled in the belt. Static
+  // rather than orbiting: a moving body would sweep through the asteroid field
+  // and there would be no way to statically clear rocks out of its path.
+  G.moon=makeBody('M',new T.Vector3(380,90,-430),82,(hue+.42)%1,(seed^0x2b1f)>>>0,
+    {relief:.5, alienN:8, xen:.5, sat:.16, lum:.46, seg:20, halo:.07, name:'MOON'});
 
   // extraction gate
   const gate=cel(new T.TorusGeometry(26,4,8,16),0x5ce1d0,{emis:.55,thick:.5});
@@ -568,13 +604,15 @@ function buildSector(seed){
   for(let i=0;i<220;i++){
     const a=rng()*PI*2, rad=380+rng()*520, y=(rng()-.5)*180;
     const p=new T.Vector3(Math.cos(a)*rad, y, Math.sin(a)*rad - 200);
-    // ~9 rocks per sector used to spawn inside the planet. Harmless while
-    // nothing collided; now they would be buried hitboxes. Push them clear.
-    const dPl=p.distanceTo(G.planet.pos);
-    if(dPl < G.planet.r+60){
-      const out=p.clone().sub(G.planet.pos);
-      if(out.lengthSq()<1e-4) out.set(0,1,0);
-      p.copy(G.planet.pos).addScaledVector(out.normalize(), G.planet.r+60+rng()*90);
+    // Rocks spawning inside a world would be buried hitboxes now that the hull
+    // collides. Push any offender clear of every body.
+    for(const b of G.bodies){
+      const clear=b.r+58;
+      if(p.distanceTo(b.pos) < clear){
+        const out=p.clone().sub(b.pos);
+        if(out.lengthSq()<1e-4) out.set(0,1,0);
+        p.copy(b.pos).addScaledVector(out.normalize(), clear+rng()*95);
+      }
     }
     const sc0=5+rng()*13;
     e.set(rng()*6,rng()*6,rng()*6); q.setFromEuler(e); s.set(sc0,sc0*(.7+rng()*.6),sc0);
@@ -634,9 +672,11 @@ function terrainH(x,z){
   const H=(a,b)=>terrHeights[clamp(b,0,TSEG)*(TSEG+1)+clamp(a,0,TSEG)]||0;
   return lerp(lerp(H(i,j),H(i+1,j),fu),lerp(H(i,j+1),H(i+1,j+1),fu),fv);
 }
-function buildSurface(){
+function buildSurface(body){
+  body = body || G.planet;
+  G.surfBody = body;
   while(R.SURFACE.children.length) R.SURFACE.remove(R.SURFACE.children[0]);
-  const sd=G.planet.seed, rng=mulberry32(sd);
+  const sd=body.seed, rng=mulberry32(sd);
   const geo=new T.PlaneGeometry(TSIZE,TSIZE,TSEG,TSEG);
   geo.rotateX(-PI/2);
   const pos=geo.attributes.position;
@@ -645,18 +685,30 @@ function buildSurface(){
     const x=pos.getX(i), z=pos.getZ(i);
     // ridged fBm gives mesas and valleys rather than smooth blobs
     let h=fbm(x*.004,z*.004,sd,5);
-    h=Math.pow(h,1.7)*150 + fbm(x*.02,z*.02,sd+41,3)*18;
+    h=Math.pow(h,1.7)*150*body.relief + fbm(x*.02,z*.02,sd+41,3)*18*body.relief;
     pos.setY(i,h); terrHeights[i]=h;
   }
   geo.computeVertexNormals();
-  const base=new T.Color().setHSL(G.planet.hue,.42,.4).getHex();
+  const base=new T.Color().setHSL(body.hue,.42,body.relief<.7?.34:.4).getHex();
   const ground=new T.Mesh(geo,celMat(base,{bands:4,rim:0x000000}));
   R.SURFACE.add(ground); terrain=ground;
 
   // sky dome tinted by the planet's hue
   const sky=new T.Mesh(new T.SphereGeometry(1800,20,14),
-    new T.MeshBasicMaterial({color:new T.Color().setHSL((G.planet.hue+.5)%1,.5,.22).getHex(),side:T.BackSide}));
+    new T.MeshBasicMaterial({color:new T.Color().setHSL((body.hue+.5)%1,.5,
+      body.relief<.7?.09:.22).getHex(),side:T.BackSide}));
   R.SURFACE.add(sky);
+  // the same sun, seen from the ground, placed to agree with LIGHT
+  if(G.sunDir){
+    const sd2=G.sunDir.clone().multiplyScalar(1500);
+    const disc=new T.Mesh(new T.SphereGeometry(58,16,12),
+      new T.MeshBasicMaterial({color:0xfff3d0}));
+    disc.position.copy(sd2); R.SURFACE.add(disc);
+    const gl=new T.Mesh(new T.SphereGeometry(120,14,11),
+      new T.MeshBasicMaterial({color:0xffc98a,transparent:true,opacity:.28,
+        side:T.BackSide,depthWrite:false,blending:T.AdditiveBlending}));
+    gl.position.copy(sd2); R.SURFACE.add(gl);
+  }
 
   // ore deposits — richer than belt rocks, which is the risk/reward hook
   oreNodes=[];
@@ -664,7 +716,7 @@ function buildSurface(){
   for(let i=0;i<26;i++){
     const x=(rng()-.5)*TSIZE*.85, z=(rng()-.5)*TSIZE*.85;
     const y=terrainH(x,z);
-    const kind=kinds[Math.floor(rng()*(rng()<.2?3:2))];
+    const kind = rng()<body.xen ? 'xenite' : kinds[Math.floor(rng()*2)];
     const col=kind==='xenite'?0xb58cff:kind==='plasma'?0x5ce1d0:0xffc043;
     const g=new T.Group();
     for(let k=0;k<4;k++){
@@ -673,7 +725,8 @@ function buildSurface(){
       c.position.set((rng()-.5)*7,(rng()-.3)*3,(rng()-.5)*7); g.add(c);
     }
     g.position.set(x,y,z); R.SURFACE.add(g);
-    oreNodes.push({id:'S'+i,obj:g,pos:g.position.clone(),kind,hp:170,r:10});
+    oreNodes.push({id:body.id+'S'+i,obj:g,pos:g.position.clone(),kind,hp:170,r:10});
+    if(G.depleted.has(body.id+'S'+i)) g.visible=false;
   }
   // landing pad marker so you can find your way back up
   const pad=cel(new T.CylinderGeometry(16,16,1,12),0x5ce1d0,{emis:.6,thick:.15});
@@ -715,8 +768,9 @@ function buildAlien(rng){
 }
 function spawnAliens(){
   aliens=[];
-  const rng=mulberry32((G.planet.seed^0x51a3)>>>0);
-  const n=13;
+  const body=G.surfBody||G.planet;
+  const rng=mulberry32((body.seed^0x51a3)>>>0);
+  const n=body.alienN;
   for(let i=0;i<n;i++){
     // nest on top of ore, so mining is contested rather than free
     let x,z;
@@ -731,7 +785,7 @@ function spawnAliens(){
     g.scale.setScalar(sc);
     g.position.set(x,terrainH(x,z),z);
     R.SURFACE.add(g);
-    const id='X'+i;
+    const id=body.id+'X'+i;
     const al={id,obj:g,pos:g.position.clone(),home:new T.Vector3(x,0,z),
       hp:Math.round(34*sc),maxhp:Math.round(34*sc),r:2.4*sc,sc,
       yaw:rng()*6,cool:rng()*2,step:rng()*6,wander:rng()*6,dead:false};
@@ -1185,6 +1239,11 @@ function stepMissiles(dt){
   }
 }
 
+function stepBodies(dt){
+  if(!G.bodies) return;
+  for(const b of G.bodies){ b.obj.rotation.y += b.spin*dt; }
+}
+
 /* ============================================================
    12c. HULL COLLISION
         A hard planet shell so you cannot pass through the world, and
@@ -1197,20 +1256,21 @@ function collideWorld(dt){
   if(G.ctx!=='SPACE'||!s.alive||G.spectate) return;
   impactCool-=dt;
 
-  // planet shell
-  const toC=G.planet.pos.clone().sub(s.pos);
-  const dC=toC.length()||.001;
-  const minR=G.planet.r+9;
-  if(dC<minR){
+  // world shells
+  for(const b of (G.bodies||[])){
+    const toC=b.pos.clone().sub(s.pos);
+    const dC=toC.length()||.001;
+    const minR=b.r+9;
+    if(dC>=minR) continue;
     const n=toC.multiplyScalar(-1/dC);            // outward
-    s.pos.copy(G.planet.pos).addScaledVector(n,minR);
+    s.pos.copy(b.pos).addScaledVector(n,minR);
     const vn=s.vel.dot(n);
     if(vn<0){
       s.vel.addScaledVector(n,-vn*1.15);
       s.vel.multiplyScalar(.72);
       const imp=-vn;
       if(imp>30&&impactCool<=0){ impactCool=.9;
-        damageMe(clamp((imp-30)*.34,0,45)); toast('Grazed the atmosphere'); }
+        damageMe(clamp((imp-30)*.34,0,45)); toast('Grazed '+b.name); }
     }
   }
 
@@ -1344,6 +1404,16 @@ function switchCtx(c){
    14. MINING / DOCKING / EXTRACTING  (the ACT button)
    ============================================================ */
 let mineTarget=null, extractHold=0;
+// Park the ship clear of whichever world it just left, rather than a fixed
+// point that only ever made sense for the planet.
+function orbitFrom(body){
+  const b=body||G.planet;
+  const away=b.pos.clone().sub(G.planet===b?new T.Vector3(0,0,0):G.planet.pos);
+  if(away.lengthSq()<1e-4) away.set(0,.3,1);
+  away.normalize();
+  G.ship.pos.copy(b.pos).addScaledVector(away,b.r+150).add(new T.Vector3(0,b.r*.3,0));
+  G.ship.vel.set(0,0,0);
+}
 function nearestBeltRock(){
   if(!G.asteroids) return null;
   let best=null,bd=64;
@@ -1376,8 +1446,15 @@ function stepAct(dt,I){
     // Automatic entry, but only while actually falling toward the planet.
     // Proximity alone would drag you in mid-dogfight and mid-mine, because
     // the belt overlaps the planet's neighbourhood.
-    const toP=G.planet.pos.clone().sub(s.pos);
-    const dpA=toP.length()-G.planet.r;
+    // whichever world you are actually closing on
+    let tb=G.planet, tbd=1e9;
+    for(const b of (G.bodies||[])){
+      const d=b.pos.distanceTo(s.pos)-b.r;
+      if(d<tbd){ tbd=d; tb=b; }
+    }
+    G.entry.body=tb;
+    const toP=tb.pos.clone().sub(s.pos);
+    const dpA=toP.length()-tb.r;
     const nrm=toP.clone().normalize();
     const closing=s.vel.dot(nrm);
     // Arm on a genuine approach. Once armed, stay armed — the approach brake
@@ -1393,14 +1470,14 @@ function stepAct(dt,I){
       // and stop closing once you are near the shell
       if(dpA<30 && closing>0) s.vel.addScaledVector(nrm,-closing*clamp(dt*3.2,0,1));
       lab='Entry';
-      msg='ATMOSPHERIC ENTRY '+Math.max(0,2.2-G.entry.t).toFixed(1)
+      msg=tb.name+' ENTRY '+Math.max(0,2.2-G.entry.t).toFixed(1)
          +'   ·   hold BRAKE to abort';
       if(G.entry.t>=2.2){
         G.entry.t=0;
-        if(!terrain) buildSurface();
+        if(G.surfBody!==tb) buildSurface(tb);
         s.pos.set(0,terrainH(0,60)+55,60); s.vel.set(0,0,0);
         switchCtx('SURFACE');
-        toast('Atmosphere — drop below 30m and hold ACT to land');
+        toast(tb.name+' — drop below 30m and hold ACT to land');
       }
       const pa0=$('p-act'); pa0.textContent=lab; pa0.classList.remove('off');
       pa0.classList.add('armed');
@@ -1453,7 +1530,8 @@ function stepAct(dt,I){
     }
     else if(dp<90){
       lab='Dive';
-      msg='Planet '+Math.round(dp)+'m — turn toward it to begin entry';
+      msg=(G.entry.body?G.entry.body.name:'World')+' '+Math.round(dp)
+         +'m — turn toward it to begin entry';
       if(I.ac) G.entry.t+=dt*2;
     }
     else { extractHold=0; actHold=0; }
@@ -1475,8 +1553,7 @@ function stepAct(dt,I){
          +'   ·   level off to abort';
       if(G.ascend.t>=2){
         G.ascend.t=0; s.fuel-=12; G.landing.down=false;
-        s.pos.set(0,60,-300); s.vel.set(0,0,0);
-        switchCtx('SPACE'); toast('Broke orbit');
+        orbitFrom(G.surfBody); switchCtx('SPACE'); toast('Broke orbit');
       }
       const pa1=$('p-act'); pa1.textContent=lab;
       pa1.classList.remove('off'); pa1.classList.add('armed');
@@ -1502,7 +1579,7 @@ function stepAct(dt,I){
       msg='Hold ACT — break orbit    (drop below 30m to land)';
       if(I.ac){ actHold+=dt; msg='Ascending… '+Math.max(0,2-actHold).toFixed(1);
         if(actHold>=2){actHold=0; s.fuel-=12; G.landing.down=false;
-          s.pos.set(0,60,-300); s.vel.set(0,0,0); switchCtx('SPACE'); toast('In orbit');} }
+          orbitFrom(G.surfBody); switchCtx('SPACE'); toast('In orbit');} }
       else actHold=0;
     } else {
       msg='Fuel too low to break orbit — set down and mine ferrite';
@@ -1989,6 +2066,7 @@ function updBlips(){
     for(const a of G.ai) if(a.hp>0) targets.push({p:a.pos,n:a.name,f:false});
     targets.push({p:G.gate.pos,n:'GATE',f:true});
     for(const d of G.derelicts) targets.push({p:d.pos,n:d.id,f:true});
+    for(const b of (G.bodies||[])) targets.push({p:b.pos,n:b.name,f:true});
   } else if(G.ctx==='SURFACE'||G.ctx==='EVA'){
     for(const a of aliens) if(!a.dead) targets.push({p:a.pos,n:'CRAWLER',f:false});
     if(G.ctx==='EVA') targets.push({p:G.ship.pos,n:'SHIP',f:true});
@@ -2534,7 +2612,7 @@ function startRun(asHost){
   applyLoadout();
   Object.assign(G.ship,{hull:G.stats.hull,shield:G.stats.shield,fuel:G.stats.fuel,
     ammo:200,missiles:G.stats.msl,alive:true,extracted:false,bank:0});
-  G.depleted=new Set(); G.looted=new Set(); terrain=null; aliens=[];
+  G.depleted=new Set(); G.looted=new Set(); terrain=null; aliens=[]; G.surfBody=null;
   G.canLeave=false; $('leave').style.display='none';
   G.msl.length=0; G.lock=null; specIdx=0; exitSpectate(); G.entry.t=0; G.ascend.t=0;
   G.camMode={ship:'chase',eva:'third'};
@@ -2609,6 +2687,7 @@ function frameBody(now,xrframe){
     stepAct(dt,I);
     stepShots(dt);
     stepGunFlash(dt);
+    stepBodies(dt);
     stepMissiles(dt);
     stepAliens(dt);
     stepAI(dt);
