@@ -96,6 +96,16 @@ input{font-family:var(--mono);font-size:16px;letter-spacing:.2em;text-transform:
 .pad.armed{border-color:var(--sodium);box-shadow:0 0 0 1px rgba(255,192,67,.35) inset}
 #lookzone{position:absolute;right:0;top:0;width:50%;height:70%;pointer-events:auto}
 
+/* ---------- mouse + keyboard ---------- */
+body.kbm #stick,body.kbm #pads,body.kbm #lookzone{display:none!important}
+#lockhint{position:absolute;left:50%;bottom:calc(env(safe-area-inset-bottom,0px) + 26px);
+  transform:translateX(-50%);display:none;padding:8px 14px;font-size:10px;
+  letter-spacing:.16em;text-transform:uppercase;color:var(--ash);
+  background:rgba(25,22,52,.9);border:1px solid rgba(141,137,173,.35)}
+#kbm{display:none;font-size:10px;line-height:1.85;text-align:left;color:var(--ash);
+  letter-spacing:.06em;border-left:2px solid rgba(141,137,173,.4);padding:6px 0 6px 10px}
+#kbm b{color:var(--bone);letter-spacing:.14em}
+
 /* ---------- lock-on ---------- */
 #wx{position:absolute;left:50%;top:calc(env(safe-area-inset-top,0px) + 62px);
   transform:translateX(-50%);display:none;padding:6px 13px;text-align:center;
@@ -169,6 +179,13 @@ body.spec #lock,body.spec #prompt,body.spec #leave,body.spec #wx{display:none!im
     <button class="ghost" id="b-vr">Enter VR</button>
     <button class="ghost" id="b-invert">Pitch: Inverted</button>
     <div id="vrdiag" class="lbl" style="text-align:left"></div>
+    <div id="kbm">
+      <b>Mouse + keyboard</b><br>
+      Click to capture the mouse · Esc releases<br>
+      Ship — mouse aims · W thrust · S brake · Shift boost<br>
+      Foot — WASD move · mouse looks · Shift jet · Q sprint<br>
+      LMB fire · RMB missile · E action · V view
+    </div>
     <div id="vault"></div>
   </div>
 </div>
@@ -229,6 +246,7 @@ body.spec #lock,body.spec #prompt,body.spec #leave,body.spec #wx{display:none!im
     <button id="b-specclose">Close sector</button>
   </div>
   <div id="wx" class="panel"><span id="wxname"></span><div class="sev"><i id="wxbar"></i></div></div>
+  <div id="lockhint">Click to capture mouse</div>
   <div id="prompt"></div>
   <div id="toast"></div>
   <div id="lookzone"></div>
@@ -466,6 +484,48 @@ bindTapPad('p-msl','msl');bindTapPad('p-cam','cam');
 const KEY={};
 addEventListener('keydown',e=>{KEY[e.code]=1;if(e.code==='Space')e.preventDefault();});
 addEventListener('keyup',e=>KEY[e.code]=0);
+// ---- mouse + pointer lock (desktop) ----
+const DESKTOP = matchMedia('(pointer:fine)').matches;
+const MOUSE={x:0,y:0,fire:0,locked:false};
+function kbmHint(){
+  $('lockhint').style.display =
+    (DESKTOP && !MOUSE.locked && G.phase==='RUN' && !inVR()) ? 'block' : 'none';
+}
+(function bindMouse(){
+  if(!DESKTOP) return;
+  $('kbm').style.display='block';
+  const cv=renderer.domElement;
+  document.addEventListener('click',e=>{
+    if(!DESKTOP||inVR()||G.phase!=='RUN'||document.pointerLockElement) return;
+    if(e.target&&e.target.closest&&e.target.closest('button,.pad,#spec,#leave')) return;
+    if(cv.requestPointerLock) cv.requestPointerLock();
+  });
+  document.addEventListener('pointerlockchange',()=>{
+    MOUSE.locked = document.pointerLockElement===cv;
+    document.body.classList.toggle('kbm',MOUSE.locked);
+    if(!MOUSE.locked){ MOUSE.fire=0; MOUSE.x=0; MOUSE.y=0; }
+    kbmHint();
+  });
+  document.addEventListener('mousemove',e=>{
+    if(!MOUSE.locked) return;
+    const dx=e.movementX||0, dy=e.movementY||0;
+    if(G.ctx==='EVA'||G.ctx==='INTERIOR'){
+      IN.lookX += dx*.0022; IN.lookY += dy*.0022;
+    } else {
+      // relative mouse steering; decays back to centre each frame
+      MOUSE.x=clamp(MOUSE.x+dx*.0038,-1,1);
+      MOUSE.y=clamp(MOUSE.y+dy*.0038,-1,1);
+    }
+  });
+  document.addEventListener('mousedown',e=>{
+    if(!MOUSE.locked) return;
+    if(e.button===0) MOUSE.fire=1;
+    if(e.button===2) TAP.msl=true;
+  });
+  document.addEventListener('mouseup',e=>{ if(e.button===0) MOUSE.fire=0; });
+  cv.addEventListener('contextmenu',e=>e.preventDefault());
+})();
+
 let prevF=0,prevV=0,prevGpY=0,prevGpRB=0;
 let GAMEPAD_OK=false;
 try{ if(navigator.getGamepads){ navigator.getGamepads(); GAMEPAD_OK=true; } }
@@ -473,8 +533,19 @@ catch(e){ GAMEPAD_OK=false; }
 
 function pollExtra(){
   let ax=IN.ax,ay=IN.ay,th=IN.thrust,fr=IN.fire,br=IN.brake,bo=IN.boost,ac=IN.act;
-  if(KEY.KeyA)ax=-1; if(KEY.KeyD)ax=1; if(KEY.KeyW)ay=-1; if(KEY.KeyS)ay=1;
+  const onFoot=(G.ctx==='EVA'||G.ctx==='INTERIOR');
+  if(KEY.KeyA||KEY.ArrowLeft)ax=-1; if(KEY.KeyD||KEY.ArrowRight)ax=1;
+  if(onFoot||!MOUSE.locked){
+    if(KEY.KeyW||KEY.ArrowUp)ay=-1; if(KEY.KeyS||KEY.ArrowDown)ay=1;
+  } else {
+    // mouse is flying the ship, so W/S become throttle instead of pitch
+    if(KEY.KeyW)th=1; if(KEY.KeyS)br=1;
+  }
   if(KEY.ShiftLeft)th=1; if(KEY.Space)fr=1; if(KEY.KeyC)br=1; if(KEY.KeyQ)bo=1; if(KEY.KeyE)ac=1;
+  if(MOUSE.locked){
+    if(MOUSE.fire) fr=1;
+    if(!onFoot){ if(MOUSE.x||MOUSE.y){ ax=MOUSE.x; ay=MOUSE.y; } }
+  }
   if(KEY.KeyF&&!prevF)TAP.msl=true; prevF=KEY.KeyF?1:0;
   if(KEY.KeyV&&!prevV)TAP.cam=true; prevV=KEY.KeyV?1:0;
   // Sandboxed artifact iframes block the Gamepad API by permissions policy and
@@ -783,8 +854,44 @@ function spawnShelters(rng,body){
     g.rotation.y=rng()*PI*2;
     R.SURFACE.add(g);
     shelters.push({id:body.id+'H'+i,obj:g,pos:g.position.clone(),
-      beacon:g.userData.beacon});
+      yaw:g.rotation.y, beacon:g.userData.beacon});
   }
+}
+/* Wall ring with an angular gap where the door is, plus a solid roof so the
+   only way in is through the doorway. Side is decided from the position before
+   the move, so you get pushed back the way you came rather than teleported. */
+const SH_WALL=8.2, SH_ROOF=12.2, SH_DOOR=.34, SH_RAD=1.1;
+function collideShelters(px,pz,nx,nz,y){
+  for(const sh of shelters){
+    if(y > sh.pos.y+SH_ROOF) continue;              // clear over the top
+    const d0=Math.hypot(px-sh.pos.x,pz-sh.pos.z);
+    let dx=nx-sh.pos.x, dz=nz-sh.pos.z;
+    const d=Math.hypot(dx,dz)||.0001;
+    if(d>SH_WALL+SH_RAD+2 && d0>SH_WALL+SH_RAD+2) continue;
+    // the doorway gap
+    const ang=Math.atan2(dx,dz);
+    const doorAng=Math.atan2(-Math.sin(sh.yaw),-Math.cos(sh.yaw));
+    let diff=Math.abs(((ang-doorAng+PI*3)%(PI*2))-PI);
+    if(diff<SH_DOOR) continue;
+    if(d0 < SH_WALL){                                // was inside: keep in
+      if(d > SH_WALL-SH_RAD){
+        const k=(SH_WALL-SH_RAD)/d; nx=sh.pos.x+dx*k; nz=sh.pos.z+dz*k;
+      }
+    } else if(d < SH_WALL+SH_RAD){                   // was outside: keep out
+      const k=(SH_WALL+SH_RAD)/d; nx=sh.pos.x+dx*k; nz=sh.pos.z+dz*k;
+    }
+  }
+  return [nx,nz];
+}
+// Ships treat a dome as ground, so you cannot hover through one.
+function groundAt(x,z){
+  let g=terrainH(x,z);
+  for(const sh of shelters){
+    if(Math.hypot(x-sh.pos.x,z-sh.pos.z) < SH_WALL+5){
+      g=Math.max(g, sh.pos.y+SH_ROOF);
+    }
+  }
+  return g;
 }
 function nearestShelter(from){
   let best=null,bd=1e9;
@@ -1554,7 +1661,7 @@ function stepFlight(dt,I){
 
   if(surf){
     // hover clamp: you fly the same ship, you just can't leave the ground behind
-    const g=terrainH(s.pos.x,s.pos.z);
+    const g=groundAt(s.pos.x,s.pos.z);
     const minY=g+6, maxY=g+130;
     if(s.pos.y<minY){ s.pos.y=minY; s.vel.y=Math.max(s.vel.y,0); }
     if(s.pos.y>maxY){ s.pos.y=maxY; s.vel.y=Math.min(s.vel.y,0); }
@@ -1760,7 +1867,7 @@ function stepAct(dt,I){
     // Altitude decides which action you get: low = land, high = leave.
     // The hold itself performs the braking burn, so you no longer have to
     // arrive already slow — that gate was invisible and effectively unlandable.
-    const gy=terrainH(s.pos.x,s.pos.z);
+    const gy=groundAt(s.pos.x,s.pos.z);
     const alt=s.pos.y-gy, spd=s.vel.length();
     // Mirror of automatic entry: climb away and the ship breaks orbit on its
     // own. Pressed against the hover ceiling counts as climbing, because the
@@ -2064,7 +2171,7 @@ function buildAstronaut(color){
 }
 function landShip(){
   const s=G.ship;
-  const gy=terrainH(s.pos.x,s.pos.z);
+  const gy=groundAt(s.pos.x,s.pos.z);
   s.pos.y=gy+2.0; s.vel.set(0,0,0);
   // flatten to yaw only so the parked ship doesn't sit nose-down in the dirt
   const e=new T.Euler().setFromQuaternion(s.quat,'YXZ');
@@ -2126,11 +2233,28 @@ function stepEVA(dt,I){
   } else if(I.th && e.suit>0){ e.vel.y += JET*dt; e.suit -= 16*dt; }
   e.vel.y -= GRAV*dt;
   e.vel.y = clamp(e.vel.y,-48,24);
+  const pxs=e.pos.x, pzs=e.pos.z, pys=e.pos.y;
   e.pos.addScaledVector(e.vel,dt);
+
+  // shelter walls
+  if(shelters.length){
+    const r=collideShelters(pxs,pzs,e.pos.x,e.pos.z,e.pos.y);
+    if(r[0]!==e.pos.x||r[1]!==e.pos.z){ e.vel.x*=.25; e.vel.z*=.25; }
+    e.pos.x=r[0]; e.pos.z=r[1];
+    for(const sh of shelters){
+      if(Math.hypot(e.pos.x-sh.pos.x,e.pos.z-sh.pos.z) >= SH_WALL) continue;
+      const roof=sh.pos.y+SH_ROOF;
+      if(pys>=roof && e.pos.y<roof){          // land on the dome
+        e.pos.y=roof; e.vel.y=0; e.grounded=true;
+      } else if(pys<roof && e.pos.y>roof-1.4){ // ceiling from inside
+        e.pos.y=roof-1.4; if(e.vel.y>0) e.vel.y=0;
+      }
+    }
+  }
 
   const gy=terrainH(e.pos.x,e.pos.z);
   if(e.pos.y<=gy){ e.pos.y=gy; e.vel.y=0; e.grounded=true; }
-  else e.grounded=false;
+  else if(!e.grounded) e.grounded=false;
   e.pos.x=clamp(e.pos.x,-TSIZE/2+15,TSIZE/2-15);
   e.pos.z=clamp(e.pos.z,-TSIZE/2+15,TSIZE/2-15);
 
@@ -2783,7 +2907,7 @@ function buildCockpit(){
 /* ============================================================
    19. FLOW
    ============================================================ */
-function show(id){['s-menu','s-lobby','s-store','s-debrief'].forEach(s=>$(s).classList.toggle('on',s===id));
+function show(id){ setTimeout(kbmHint,0);['s-menu','s-lobby','s-store','s-debrief'].forEach(s=>$(s).classList.toggle('on',s===id));
   $('hud').classList.toggle('on', id===null);}
 function code4(){const A='ACDEFHJKLMNPQRTUVWXY349';let s='';
   for(let i=0;i<4;i++)s+=A[Math.floor(Math.random()*A.length)];return s;}
@@ -2850,6 +2974,7 @@ function startRun(asHost){
   if(G.host) spawnAI(4); else G.ai=[];
   switchCtx('SPACE');
   camPos.copy(G.ship.pos); camLook.copy(G.ship.pos);
+  kbmHint();
   show(null);
   toast('Sector live — 8 minutes. Bank it or lose it.');
 }
@@ -2885,6 +3010,10 @@ function frameBody(now,xrframe){
   const dt=Math.min((now-last)/1000,.05); last=now;
   pollXR();
   pollHands(xrframe);
+  if(MOUSE.locked){
+    const k=1-clamp(dt*1.9,0,.9);
+    MOUSE.x*=k; MOUSE.y*=k;
+  }
   if(inVR()){
     // chase and third-person are nauseating in a headset
     G.camMode.ship='cockpit'; G.camMode.eva='fps';
