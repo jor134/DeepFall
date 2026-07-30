@@ -29,6 +29,9 @@ button{font-family:var(--mono);font-size:13px;letter-spacing:.1em;text-transform
   color:var(--void);background:var(--sodium);border:0;padding:14px 18px;cursor:pointer;font-weight:700}
 button.ghost{background:transparent;color:var(--bone);border:1px solid rgba(141,137,173,.5)}
 button:active{transform:translateY(1px)}
+textarea{font-family:var(--mono);font-size:10px;line-height:1.4;background:#0f0d24;
+  color:var(--bone);border:1px solid rgba(141,137,173,.5);padding:8px;width:100%;
+  resize:vertical;word-break:break-all;letter-spacing:0}
 input{font-family:var(--mono);font-size:16px;letter-spacing:.2em;text-transform:uppercase;
   background:#0f0d24;color:var(--bone);border:1px solid rgba(141,137,173,.5);padding:12px;width:100%;text-align:center}
 
@@ -176,6 +179,8 @@ body.spec #lock,body.spec #prompt,body.spec #leave,body.spec #wx{display:none!im
       <button class="ghost" id="b-join">Join</button>
     </div>
     <button class="ghost" id="b-solo">Fly solo</button>
+    <button class="ghost" id="b-direct">Direct link (no server)</button>
+    <button class="ghost" id="b-save">Save code</button>
     <button class="ghost" id="b-store">Supply store</button>
     <button class="ghost" id="b-vr">Enter VR</button>
     <button class="ghost" id="b-invert">Pitch: Inverted</button>
@@ -201,6 +206,55 @@ body.spec #lock,body.spec #prompt,body.spec #leave,body.spec #wx{display:none!im
   <div class="col">
     <button id="b-launch">Launch</button>
     <button class="ghost" id="b-leave">Back out</button>
+  </div>
+</div>
+
+<!-- SAVE CODE -->
+<div class="screen" id="s-save">
+  <div id="title" style="font-size:clamp(20px,6.5vw,34px)">SAVE CODE</div>
+  <div id="sub">Progress that survives a reload</div>
+  <div id="savewhy" class="lbl" style="text-align:left"></div>
+  <div class="col">
+    <div class="lbl">Your progress right now</div>
+    <textarea id="sv-out" rows="3" readonly></textarea>
+    <button id="b-svcopy">Copy save code</button>
+    <div class="lbl">Restore from a code</div>
+    <textarea id="sv-in" rows="3" placeholder="paste a save code"></textarea>
+    <button class="ghost" id="b-svload">Load save</button>
+    <div id="sv-stat" class="lbl"></div>
+    <button class="ghost" id="b-svback">Back to dock</button>
+  </div>
+</div>
+
+<!-- DIRECT LINK (no server) -->
+<div class="screen" id="s-direct">
+  <div id="title" style="font-size:clamp(20px,6.5vw,34px)">DIRECT LINK</div>
+  <div id="sub">Peer to peer · no storage needed</div>
+  <div class="col" id="d-pick">
+    <button id="b-dhost">Host a direct game</button>
+    <button class="ghost" id="b-djoin">Join a direct game</button>
+    <button class="ghost" id="b-dback">Back</button>
+  </div>
+  <div class="col" id="d-host" style="display:none">
+    <div class="lbl">1 · Paste a friend's join code</div>
+    <textarea id="d-in" rows="3" placeholder="paste join code here"></textarea>
+    <button id="b-dans">Generate reply</button>
+    <div class="lbl">2 · Send this reply back to them</div>
+    <textarea id="d-out" rows="3" readonly></textarea>
+    <button class="ghost" id="b-dcopy">Copy reply</button>
+    <div id="d-stat" class="lbl"></div>
+    <button id="b-dlaunch">Launch sector</button>
+    <button class="ghost" id="b-dback2">Back</button>
+  </div>
+  <div class="col" id="d-join" style="display:none">
+    <div class="lbl">1 · Send this join code to the host</div>
+    <textarea id="j-out" rows="3" readonly></textarea>
+    <button class="ghost" id="b-jcopy">Copy join code</button>
+    <div class="lbl">2 · Paste their reply</div>
+    <textarea id="j-in" rows="3" placeholder="paste reply here"></textarea>
+    <button id="b-jgo">Connect</button>
+    <div id="j-stat" class="lbl"></div>
+    <button class="ghost" id="b-dback3">Back</button>
   </div>
 </div>
 
@@ -1278,12 +1332,14 @@ async function probeBackend(){
     }
   }catch(e){ /* not deployed, or no route */ }
   try{
-    if(window.storage&&window.storage.set){
+    if(!window.storage||!window.storage.set){ NETB.err='no window.storage in this context'; }
+    else {
       await window.storage.set('deepfall:nprobe','1',true);
       const r=await window.storage.get('deepfall:nprobe',true);
       if(r&&r.value==='1'){ NETB.mode='artifact'; return; }
+      NETB.err='window.storage shared mode is a stub here (write accepted, read empty)';
     }
-  }catch(e){}
+  }catch(e){ NETB.err='window.storage threw ('+(e.name||'error')+')'; }
   NETB.mode='none';
 }
 async function sGet(k){try{const r=await window.storage.get(k,true);return r?JSON.parse(r.value):null;}catch(e){return null;}}
@@ -1313,7 +1369,7 @@ const P2P_MS=50;                                   // 20Hz peer tick
 const ICE={iceServers:[{urls:'stun:stun.l.google.com:19302'},
                        {urls:'stun:global.stun.twilio.com:3478'}]};
 const P2P={
-  on:false, peers:{}, inbox:{},   // host: pid -> {pc,dc}, pid -> snapshot
+  on:false, direct:false, peers:{}, inbox:{},   // host: pid -> {pc,dc}, pid -> snapshot
   host:null,                      // client: {pc,dc}
   tSig:0, lastWorldKV:0, failed:{}
 };
@@ -1365,7 +1421,7 @@ function wireChannel(dc,pid){
   dc.onclose=()=>{ if(G.host&&pid) delete P2P.inbox[pid]; };
 }
 async function p2pClientConnect(){
-  if(G.host||!NET.on||NETB.mode==='none') return;
+  if(G.host||!NET.on||NETB.mode==='none'||P2P.direct) return;
   if(P2P.host) return;
   try{
     const pc=new RTCPeerConnection(ICE);
@@ -1392,7 +1448,7 @@ async function p2pClientPoll(){
   }catch(e){ h.answered=true; }
 }
 async function p2pHostPoll(){
-  if(!G.host||!NET.on) return;
+  if(!G.host||!NET.on||P2P.direct||NETB.mode==='none') return;
   const offers=await sigOffers();
   for(const pid in offers){
     if(pid===G.me.id||P2P.peers[pid]||P2P.failed[pid]) continue;
@@ -2656,21 +2712,35 @@ function updBlips(){
 // Persistence adapter. localStorage is blocked in the artifact sandbox but is
 // perfectly fine on a real web page, so probe rather than assume.
 const VAULT={
-  mode:'mem', mem:{},
+  mode:'mem', mem:{}, why:'',
   async init(){
     try{
       localStorage.setItem('df:probe','1');
       if(localStorage.getItem('df:probe')==='1'){
         localStorage.removeItem('df:probe'); this.mode='local'; return;
       }
-    }catch(e){}
+      this.why='localStorage silently discarded the write';
+    }catch(e){ this.why='localStorage blocked ('+(e.name||'error')+')'; }
+    // The file-preview context exposes window.storage but no-ops on it, so a
+    // shallow existence check is not enough — write, then read back.
     try{
-      if(window.storage&&window.storage.set){
-        await window.storage.set('deepfall:probe','1',false);
-        const r=await window.storage.get('deepfall:probe',false);
-        if(r&&r.value==='1'){ this.mode='artifact'; return; }
+      if(!window.storage||!window.storage.set){
+        this.why+=' · no window.storage';
+      } else {
+        // set() returns null on failure; get() throws on a missing key. So a
+        // null set followed by a thrown get means "not persisting", which is
+        // very different from "the API is broken".
+        const w=await window.storage.set('deepfall:probe','1',false);
+        if(!w){
+          this.why+=' · window.storage.set returned null — writes are not persisting';
+        } else {
+          const r=await window.storage.get('deepfall:probe',false);
+          if(r&&r.value==='1'){ this.mode='artifact'; return; }
+          this.why+=' · write accepted but read back '
+            +(r?JSON.stringify(r.value):'nothing');
+        }
       }
-    }catch(e){}
+    }catch(e){ this.why+=' · window.storage threw ('+(e.name||'error')+')'; }
     this.mode='mem';
   },
   async get(k){
@@ -3155,9 +3225,162 @@ function buildCockpit(){
 }
 
 /* ============================================================
+   18e. DIRECT LINK
+        Signalling by copy-paste. WebRTC needs no server, only a way to
+        move one offer and one answer between two people — and because
+        ICE gathering completes before we serialise, each is a single
+        self-contained blob. This is the path that works when there is
+        no storage bridge at all.
+   ============================================================ */
+function b64enc(o){ return btoa(unescape(encodeURIComponent(JSON.stringify(o)))); }
+function b64dec(t){ return JSON.parse(decodeURIComponent(escape(atob(t.trim())))); }
+function copyOut(el,statusEl,msg){
+  const v=$(el).value; if(!v) return;
+  try{ $(el).select(); }catch(e){}
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(v).then(
+      ()=>{ $(statusEl).textContent=msg; },
+      ()=>{ $(statusEl).textContent='Copy blocked — select the text manually'; });
+  } else {
+    try{ document.execCommand('copy'); $(statusEl).textContent=msg; }
+    catch(e){ $(statusEl).textContent='Select the text and copy manually'; }
+  }
+}
+function directPrep(asHost){
+  G.me.name=($('name').value||'RAIDER').toUpperCase().slice(0,9);
+  G.host=asHost; G.solo=false; G.code='DRCT';
+  NET.on=true; G.phase='LOBBY';
+  P2P.direct=true;
+}
+$('b-direct').onclick=()=>{
+  $('d-pick').style.display='flex';
+  $('d-host').style.display='none';
+  $('d-join').style.display='none';
+  $('d-stat').textContent=''; $('j-stat').textContent='';
+  show('s-direct');
+};
+const dBack=()=>{ p2pClose(); NET.on=false; P2P.direct=false; G.phase='MENU'; show('s-menu'); };
+$('b-dback').onclick=dBack; $('b-dback2').onclick=dBack; $('b-dback3').onclick=dBack;
+
+$('b-dhost').onclick=()=>{
+  directPrep(true);
+  G.seed=hashStr(''+Date.now()+Math.random());
+  $('d-pick').style.display='none';
+  $('d-host').style.display='flex';
+  $('d-stat').textContent='Waiting for a join code. You can add several friends one at a time.';
+};
+$('b-dans').onclick=async()=>{
+  const txt=$('d-in').value.trim();
+  if(!txt){ $('d-stat').textContent='Paste their join code first.'; return; }
+  let off;
+  try{ off=b64dec(txt); }catch(e){ $('d-stat').textContent='That is not a valid join code.'; return; }
+  const pid=(off.pid||('p'+Math.random().toString(36).slice(2,7)));
+  try{
+    const pc=new RTCPeerConnection(ICE);
+    P2P.peers[pid]={pc,dc:null};
+    pc.ondatachannel=ev=>{
+      P2P.peers[pid].dc=ev.channel;
+      wireChannel(ev.channel,pid);
+      ev.channel.onopen=()=>{ $('d-stat').textContent='Linked: '+(off.name||pid)
+        +'  ·  '+p2pLive()+' connected'; };
+    };
+    await pc.setRemoteDescription(off.sdp);
+    const ans=await pc.createAnswer();
+    await pc.setLocalDescription(ans);
+    $('d-stat').textContent='Gathering network routes…';
+    await iceComplete(pc);
+    $('d-out').value=b64enc({sdp:pc.localDescription,seed:G.seed});
+    $('d-stat').textContent='Reply ready — send it back to them.';
+    $('d-in').value='';
+  }catch(e){ $('d-stat').textContent='Failed: '+(e.message||e); }
+};
+$('b-dcopy').onclick=()=>copyOut('d-out','d-stat','Reply copied.');
+$('b-jcopy').onclick=()=>copyOut('j-out','j-stat','Join code copied.');
+$('b-dlaunch').onclick=()=>{
+  if(!p2pLive()) { $('d-stat').textContent='Nobody linked yet — launching solo-ish.'; }
+  startRun(true);
+};
+
+$('b-djoin').onclick=async()=>{
+  directPrep(false);
+  $('d-pick').style.display='none';
+  $('d-join').style.display='flex';
+  $('j-stat').textContent='Generating your join code…';
+  try{
+    p2pClose();
+    const pc=new RTCPeerConnection(ICE);
+    const dc=pc.createDataChannel('df',{ordered:false,maxRetransmits:0});
+    wireChannel(dc,null);
+    P2P.host={pc,dc,sent:true,answered:false};
+    dc.onopen=()=>{ $('j-stat').textContent='Linked — waiting for the host to launch.'; };
+    const off=await pc.createOffer();
+    await pc.setLocalDescription(off);
+    await iceComplete(pc);
+    $('j-out').value=b64enc({sdp:pc.localDescription,name:G.me.name,pid:G.me.id});
+    $('j-stat').textContent='Send that to the host, then paste their reply.';
+  }catch(e){ $('j-stat').textContent='Failed: '+(e.message||e); }
+};
+$('b-jgo').onclick=async()=>{
+  const t=$('j-in').value.trim();
+  if(!t||!P2P.host){ $('j-stat').textContent='Generate your join code first.'; return; }
+  try{
+    const a=b64dec(t);
+    await P2P.host.pc.setRemoteDescription(a.sdp);
+    if(a.seed) G.seed=a.seed;
+    P2P.host.answered=true;
+    $('j-stat').textContent='Connecting…';
+  }catch(e){ $('j-stat').textContent='That reply could not be read.'; }
+};
+
+/* ============================================================
+   18f. SAVE CODES
+        Persistence for contexts with no storage bridge at all. The
+        vault round-trips through a base64 blob the player holds onto —
+        the same trick as the direct-link handshake, applied to save
+        data instead of SDP.
+   ============================================================ */
+function makeSaveCode(){
+  return b64enc({v:1,t:Date.now(),vault:G.vault});
+}
+function applySaveCode(txt){
+  const o=b64dec(txt);
+  if(!o||o.v!==1||!o.vault) throw new Error('not a DEEPFALL save code');
+  G.vault=Object.assign({credits:0,runs:0,best:0,invert:true,
+    owned:['w_d','s_d','c_d'],eq:{w:'w_d',s:'s_d',c:'c_d'}}, o.vault);
+  if(!Array.isArray(G.vault.owned)) G.vault.owned=['w_d','s_d','c_d'];
+  if(!G.vault.eq) G.vault.eq={w:'w_d',s:'s_d',c:'c_d'};
+  if(typeof G.vault.invert!=='boolean') G.vault.invert=true;
+  applyLoadout(); refreshSwatch(); updInvertBtn(); saveVault();
+}
+function refreshSaveScreen(){
+  $('sv-out').value=makeSaveCode();
+  const w=findItem('w',G.vault.eq.w), sh=findItem('s',G.vault.eq.s);
+  $('savewhy').textContent = VAULT.mode==='mem'
+    ? 'No storage in this context, so progress is lost on reload. Copy this code '
+      + 'before you close the tab and paste it back next time.'
+    : 'Progress is already saved automatically here. This code is for moving it '
+      + 'to another device or browser.';
+  $('sv-stat').textContent = G.vault.credits.toLocaleString()+'cr · '
+    + G.vault.runs+' runs · '+(sh?sh.name:'—')+' / '+(w?w.name:'—');
+}
+$('b-save').onclick=()=>{ refreshSaveScreen(); show('s-save'); };
+$('b-svback').onclick=()=>show('s-menu');
+$('b-svcopy').onclick=()=>copyOut('sv-out','sv-stat','Save code copied — keep it somewhere.');
+$('b-svload').onclick=()=>{
+  const t=$('sv-in').value.trim();
+  if(!t){ $('sv-stat').textContent='Paste a save code first.'; return; }
+  try{
+    applySaveCode(t);
+    $('sv-in').value='';
+    refreshSaveScreen();
+    $('sv-stat').textContent='Restored — '+G.vault.credits.toLocaleString()+'cr.';
+  }catch(e){ $('sv-stat').textContent='Could not read that: '+(e.message||e); }
+};
+
+/* ============================================================
    19. FLOW
    ============================================================ */
-function show(id){ setTimeout(kbmHint,0);['s-menu','s-lobby','s-store','s-debrief'].forEach(s=>$(s).classList.toggle('on',s===id));
+function show(id){ setTimeout(kbmHint,0);['s-menu','s-lobby','s-store','s-direct','s-save','s-debrief'].forEach(s=>$(s).classList.toggle('on',s===id));
   $('hud').classList.toggle('on', id===null);}
 function code4(){const A='ACDEFHJKLMNPQRTUVWXY349';let s='';
   for(let i=0;i<4;i++)s+=A[Math.floor(Math.random()*A.length)];return s;}
@@ -3212,10 +3435,8 @@ $('leave').onclick=()=>{
 $('b-again').onclick=()=>{NET.on=false;p2pClose();G.phase='MENU';show('s-menu');loadVault();};
 function toastMenu(m){const w=$('warn');w.style.display='block';w.textContent=m;}
 function netHelp(){
-  if(NETB.err) return 'Multiplayer unavailable — '+NETB.err+
-    '. Add an Upstash Redis (or Vercel KV) store in the Vercel dashboard and redeploy.';
-  return 'Multiplayer unavailable here — no /api/room route and no artifact storage. '+
-    'Fly solo works. Deploy to Vercel with api/room.js and a KV store bound.';
+  return 'No storage bridge here — but Direct link still works. It connects '
+       + 'players peer to peer by pasting one code each way, no server involved.';
 }
 
 function startRun(asHost){
@@ -3250,6 +3471,10 @@ function endRun(early){
   $('board').innerHTML=rows.map(r=>
     `<tr><td style="color:${r.me?'var(--coolant)':r.dead?'var(--ash)':'var(--bone)'}">${r.n}${r.dead?' (destroyed)':''}</td><td>${r.v}cr</td></tr>`).join('');
   exitSpectate();
+  if(VAULT.mode==='mem' && G.vault.credits>0){
+    toast('No storage here — grab a Save code from the dock to keep '
+      +G.vault.credits.toLocaleString()+'cr');
+  }
   $('sub-debrief').textContent = early
     ? (G.host ? 'You closed the sector' : 'Extracted early — the sector ran on without you')
     : 'Sector clock expired';
@@ -3368,9 +3593,11 @@ function frameBody(now,xrframe){
                   : 'not saved — resets on reload';
   const netWord = NETB.mode==='api' ? 'multiplayer via Vercel KV'
                 : NETB.mode==='artifact' ? 'multiplayer via artifact storage'
-                : 'solo only';
+                : 'no storage — use Direct link for multiplayer';
   if(NETB.mode==='none') toastMenu(netHelp());
-  $('netdiag').textContent='Progress '+vaultWord+' · '+netWord;
+  $('netdiag').innerHTML='Progress '+vaultWord+' · '+netWord
+    + (VAULT.why? '<br><span style="opacity:.7">'+VAULT.why+'</span>':'')
+    + (NETB.err? '<br><span style="opacity:.7">'+NETB.err+'</span>':'');
   loadVault();
   buildXRHud();
   buildViewGun();
