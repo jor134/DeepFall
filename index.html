@@ -60,6 +60,7 @@ input{font-family:var(--mono);font-size:16px;letter-spacing:.2em;text-transform:
 #topright{position:absolute;top:calc(env(safe-area-inset-top,0px) + 10px);right:10px;padding:8px;text-align:right;min-width:118px}
 #clock{font-size:22px;font-weight:700;color:var(--sodium);letter-spacing:.04em}
 #cargo{font-size:11px;line-height:1.7;color:var(--bone)}
+#link{font-size:9px;letter-spacing:.14em;margin:1px 0 3px;color:var(--ash)}
 #prompt{position:absolute;left:50%;top:52%;transform:translateX(-50%);font-size:12px;letter-spacing:.18em;
   text-transform:uppercase;color:var(--sodium);text-shadow:0 2px 10px #000;display:none;text-align:center}
 #leave{position:absolute;left:50%;top:calc(env(safe-area-inset-top,0px) + 14px);
@@ -179,6 +180,7 @@ body.spec #lock,body.spec #prompt,body.spec #leave,body.spec #wx{display:none!im
     <button class="ghost" id="b-vr">Enter VR</button>
     <button class="ghost" id="b-invert">Pitch: Inverted</button>
     <div id="vrdiag" class="lbl" style="text-align:left"></div>
+    <div id="netdiag" class="lbl" style="text-align:left"></div>
     <div id="kbm">
       <b>Mouse + keyboard</b><br>
       Click to capture the mouse · Esc releases<br>
@@ -237,6 +239,7 @@ body.spec #lock,body.spec #prompt,body.spec #leave,body.spec #wx{display:none!im
   </div>
   <div id="topright" class="panel">
     <div id="clock">08:00</div>
+    <div id="link"></div>
     <div id="cargo"></div>
   </div>
   <div id="leave">Bank secure — leave sector</div>
@@ -1251,8 +1254,38 @@ function footCollide(p,nx,nz){
        Host reads all slots, simulates AI + world, writes world.
        (WebRTC fast path is BUILD 2.)
    ============================================================ */
-const NET={on:false,tPush:0,tPull:0,hitOut:[],world:null,lastWorld:0};
+const NET={on:false,tPush:0,tPull:0,tP2P:0,hitOut:[],world:null,lastWorld:0,lastBuilt:null};
+// 'api'      -> Vercel serverless route backed by a KV store (deployed site)
+// 'artifact' -> window.storage in shared mode (chat artifact runtime)
+// 'none'     -> solo only
+const NETB={mode:'none',err:''};
+const NET_MS=250;                      // poll interval; raise to cut store usage
 const K=p=>'deepfall:'+G.code+':'+p;
+
+async function api(body){
+  const r=await fetch('/api/room',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  if(!r.ok) throw new Error('api '+r.status);
+  return r.json();
+}
+async function probeBackend(){
+  try{
+    const r=await fetch('/api/room',{method:'GET'});
+    if(r.ok){
+      const j=await r.json();
+      if(j.ok){ NETB.mode='api'; return; }
+      NETB.err='route is live but no KV store is bound to the project';
+    }
+  }catch(e){ /* not deployed, or no route */ }
+  try{
+    if(window.storage&&window.storage.set){
+      await window.storage.set('deepfall:nprobe','1',true);
+      const r=await window.storage.get('deepfall:nprobe',true);
+      if(r&&r.value==='1'){ NETB.mode='artifact'; return; }
+    }
+  }catch(e){}
+  NETB.mode='none';
+}
 async function sGet(k){try{const r=await window.storage.get(k,true);return r?JSON.parse(r.value):null;}catch(e){return null;}}
 async function sSet(k,v){try{await window.storage.set(k,JSON.stringify(v),true);}catch(e){}}
 async function sList(p){try{const r=await window.storage.list(p,true);return r?r.keys:[];}catch(e){return [];}}
@@ -1265,18 +1298,185 @@ function mySnapshot(){
     hull:Math.round(s.hull),alive:s.alive,ext:s.extracted,bank:s.bank,
     hits:NET.hitOut.splice(0,8), t:Date.now()};
 }
+/* ============================================================
+   10b. WEBRTC PEER LANE
+        Star topology: every client dials the host. Position traffic
+        moves onto unreliable/unordered data channels at 20Hz, and the
+        KV store drops to a 1.5s lane carrying only signalling, late
+        joiners and peers whose NAT refused to cooperate.
+
+        Non-trickle ICE — we wait for gathering to finish so each peer
+        needs exactly one offer and one answer blob. Simpler, and cheap
+        enough that signalling barely registers against the store quota.
+   ============================================================ */
+const P2P_MS=50;                                   // 20Hz peer tick
+const ICE={iceServers:[{urls:'stun:stun.l.google.com:19302'},
+                       {urls:'stun:global.stun.twilio.com:3478'}]};
+const P2P={
+  on:false, peers:{}, inbox:{},   // host: pid -> {pc,dc}, pid -> snapshot
+  host:null,                      // client: {pc,dc}
+  tSig:0, lastWorldKV:0, failed:{}
+};
+function p2pLive(){
+  if(G.host) return Object.values(P2P.peers).filter(p=>p.dc&&p.dc.readyState==='open').length;
+  return (P2P.host&&P2P.host.dc&&P2P.host.dc.readyState==='open')?1:0;
+}
+function iceComplete(pc,ms){
+  return new Promise(res=>{
+    if(pc.iceGatheringState==='complete') return res();
+    const done=()=>{ clearTimeout(t); pc.removeEventListener('icegatheringstatechange',chk); res(); };
+    const chk=()=>{ if(pc.iceGatheringState==='complete') done(); };
+    const t=setTimeout(done, ms||3500);   // give up gathering and send what we have
+    pc.addEventListener('icegatheringstatechange',chk);
+  });
+}
+// signalling rides whichever store backend is live
+async function sigSend(op,pid,data){
+  if(NETB.mode==='api'){ try{ await api({code:G.code,op,pid,data}); }catch(e){} return null; }
+  if(NETB.mode==='artifact'){ await sSet(K(op+':'+pid), data); return null; }
+  return null;
+}
+async function sigOffers(){
+  if(NETB.mode==='api'){
+    try{ return (await api({code:G.code,op:'offers'})).offers||{}; }catch(e){ return {}; }
+  }
+  if(NETB.mode==='artifact'){
+    const out={};
+    const keys=await sList('deepfall:'+G.code+':offer:');
+    for(const k of keys){ const v=await sGet(k); if(v) out[k.split(':').pop()]=v; }
+    return out;
+  }
+  return {};
+}
+async function sigAnswer(pid){
+  if(NETB.mode==='api'){
+    try{ return (await api({code:G.code,op:'answer-get',pid})).answer||null; }catch(e){ return null; }
+  }
+  if(NETB.mode==='artifact') return await sGet(K('answer:'+pid));
+  return null;
+}
+function wireChannel(dc,pid){
+  // unreliable + unordered: a stale position is worthless, never resend it
+  dc.onmessage=ev=>{
+    let m; try{ m=JSON.parse(ev.data); }catch(e){ return; }
+    if(m.t==='w' && !G.host){ applyWorld(m.d); }
+    else if(m.t==='p' && G.host){ P2P.inbox[pid||m.d.id]=m.d; }
+  };
+  dc.onclose=()=>{ if(G.host&&pid) delete P2P.inbox[pid]; };
+}
+async function p2pClientConnect(){
+  if(G.host||!NET.on||NETB.mode==='none') return;
+  if(P2P.host) return;
+  try{
+    const pc=new RTCPeerConnection(ICE);
+    const dc=pc.createDataChannel('df',{ordered:false,maxRetransmits:0});
+    wireChannel(dc,null);
+    P2P.host={pc,dc,sent:false,answered:false};
+    dc.onopen=()=>toast('Peer link established');
+    const off=await pc.createOffer();
+    await pc.setLocalDescription(off);
+    await iceComplete(pc);
+    await sigSend('offer',G.me.id,pc.localDescription);
+    P2P.host.sent=true;
+  }catch(e){ P2P.host=null; }
+}
+async function p2pClientPoll(){
+  const h=P2P.host;
+  if(!h||!h.sent||h.answered) return;
+  const a=await sigAnswer(G.me.id);
+  if(!a) return;
+  try{
+    await h.pc.setRemoteDescription(a);
+    h.answered=true;
+    if(NETB.mode==='api'){ try{ await api({code:G.code,op:'sig-clear',pid:G.me.id}); }catch(e){} }
+  }catch(e){ h.answered=true; }
+}
+async function p2pHostPoll(){
+  if(!G.host||!NET.on) return;
+  const offers=await sigOffers();
+  for(const pid in offers){
+    if(pid===G.me.id||P2P.peers[pid]||P2P.failed[pid]) continue;
+    P2P.peers[pid]={pc:null,dc:null};
+    try{
+      const pc=new RTCPeerConnection(ICE);
+      P2P.peers[pid].pc=pc;
+      pc.ondatachannel=ev=>{
+        P2P.peers[pid].dc=ev.channel;
+        wireChannel(ev.channel,pid);
+        ev.channel.onopen=()=>toast('Peer linked: '+pid);
+      };
+      await pc.setRemoteDescription(offers[pid]);
+      const ans=await pc.createAnswer();
+      await pc.setLocalDescription(ans);
+      await iceComplete(pc);
+      await sigSend('answer',pid,pc.localDescription);
+    }catch(e){ P2P.failed[pid]=1; delete P2P.peers[pid]; }
+  }
+}
+function p2pTick(){
+  if(!NET.on) return;
+  if(G.host){
+    const w=NET.lastBuilt;
+    if(!w) return;
+    const msg=JSON.stringify({t:'w',d:w});
+    for(const pid in P2P.peers){
+      const dc=P2P.peers[pid].dc;
+      if(dc&&dc.readyState==='open'){ try{ dc.send(msg); }catch(e){} }
+    }
+  } else {
+    const h=P2P.host;
+    if(h&&h.dc&&h.dc.readyState==='open'){
+      try{ h.dc.send(JSON.stringify({t:'p',d:mySnapshot()})); }catch(e){}
+    }
+  }
+}
+function p2pClose(){
+  try{ if(P2P.host&&P2P.host.pc) P2P.host.pc.close(); }catch(e){}
+  for(const pid in P2P.peers){ try{ P2P.peers[pid].pc&&P2P.peers[pid].pc.close(); }catch(e){} }
+  P2P.host=null; P2P.peers={}; P2P.inbox={}; P2P.failed={};
+}
+
 async function netPush(){
   if(!NET.on) return;
-  await sSet(K('p:'+G.me.id), mySnapshot());
+  // a live data channel already carries this at 20Hz
+  if(!G.host && p2pLive()) return;
+  const snap=mySnapshot();
+  if(NETB.mode==='api'){
+    try{ await api({code:G.code,op:'push',pid:G.me.id,data:snap}); }catch(e){}
+    return;
+  }
+  await sSet(K('p:'+G.me.id), snap);
 }
 async function netPullClient(){
+  if(p2pLive()) return;              // world arrives over the channel
+  if(NETB.mode==='api'){
+    try{ const j=await api({code:G.code,op:'wget'}); if(j.world) applyWorld(j.world); }
+    catch(e){}
+    return;
+  }
   const w=await sGet(K('world'));
   if(w) applyWorld(w);
 }
 async function netHostTick(){
-  const keys=await sList('deepfall:'+G.code+':p:');
   const list=[];
-  for(const k of keys){const v=await sGet(k); if(v && Date.now()-v.t<9000) list.push(v);}
+  const seen=new Set();
+  // peers on a data channel are fresher than anything in the store
+  for(const pid in P2P.inbox){
+    const v=P2P.inbox[pid];
+    if(v && Date.now()-v.t<9000){ list.push(v); seen.add(v.id); }
+  }
+  if(NETB.mode==='api'){
+    // one round trip for every player, instead of a list plus N gets
+    try{
+      const j=await api({code:G.code,op:'pull'});
+      for(const v of (j.players||[]))
+        if(v && !seen.has(v.id) && Date.now()-v.t<9000) list.push(v);
+    }catch(e){}
+  } else {
+    const keys=await sList('deepfall:'+G.code+':p:');
+    for(const k of keys){const v=await sGet(k);
+      if(v && !seen.has(v.id) && Date.now()-v.t<9000) list.push(v);}
+  }
   const now=Date.now();
   const players={};
   players[G.me.id]=mySnapshot();
@@ -1298,6 +1498,15 @@ async function netHostTick(){
       qx:+a.quat.x.toFixed(3),qy:+a.quat.y.toFixed(3),qz:+a.quat.z.toFixed(3),qw:+a.quat.w.toFixed(3),
       hp:Math.round(a.hp),name:a.name})),
     dep:[...G.depleted], loot:[...G.looted]};
+  NET.lastBuilt=w;                     // p2pTick broadcasts this at 20Hz
+  // With every client on a channel the store only has to serve late joiners,
+  // so throttle it hard rather than writing at the old rate.
+  const everyoneLinked = Object.keys(G.remotes).length>0 &&
+    p2pLive()>=Object.keys(G.remotes).length;
+  const gap = everyoneLinked ? 3000 : 900;
+  if(performance.now()-P2P.lastWorldKV < gap) return;
+  P2P.lastWorldKV=performance.now();
+  if(NETB.mode==='api'){ try{ await api({code:G.code,op:'world',data:w}); }catch(e){} return; }
   await sSet(K('world'), w);
 }
 function applyWorld(w){
@@ -2384,6 +2593,13 @@ function updHUD(dt){
   $('v-ammo').style.width=clamp(s.ammo/200*100,0,100)+'%';
   const m=Math.floor(G.clock/60), sec=Math.floor(G.clock%60);
   $('clock').textContent=m+':'+String(sec).padStart(2,'0');
+  if(NET.on){
+    const n=p2pLive(), tot=G.host?Object.keys(G.remotes).length:1;
+    const el=$('link');
+    if(n>0){ el.textContent='P2P '+n+'/'+Math.max(n,tot);
+      el.style.color='var(--coolant)'; }
+    else { el.textContent='RELAY'; el.style.color='var(--ash)'; }
+  } else $('link').textContent='';
   $('cargo').innerHTML=
     `<span style="color:var(--sodium)">FE ${G.cargo.ferrite}</span> · `+
     `<span style="color:var(--coolant)">PL ${G.cargo.plasma}</span> · `+
@@ -2437,9 +2653,43 @@ function updBlips(){
 /* ============================================================
    18. VAULT (persists between runs)
    ============================================================ */
+// Persistence adapter. localStorage is blocked in the artifact sandbox but is
+// perfectly fine on a real web page, so probe rather than assume.
+const VAULT={
+  mode:'mem', mem:{},
+  async init(){
+    try{
+      localStorage.setItem('df:probe','1');
+      if(localStorage.getItem('df:probe')==='1'){
+        localStorage.removeItem('df:probe'); this.mode='local'; return;
+      }
+    }catch(e){}
+    try{
+      if(window.storage&&window.storage.set){
+        await window.storage.set('deepfall:probe','1',false);
+        const r=await window.storage.get('deepfall:probe',false);
+        if(r&&r.value==='1'){ this.mode='artifact'; return; }
+      }
+    }catch(e){}
+    this.mode='mem';
+  },
+  async get(k){
+    if(this.mode==='local'){ try{ return localStorage.getItem(k); }catch(e){ return null; } }
+    if(this.mode==='artifact'){
+      try{ const r=await window.storage.get(k,false); return r?r.value:null; }catch(e){ return null; }
+    }
+    return this.mem[k]===undefined?null:this.mem[k];
+  },
+  async set(k,v){
+    if(this.mode==='local'){ try{ localStorage.setItem(k,v); }catch(e){} return; }
+    if(this.mode==='artifact'){ try{ await window.storage.set(k,v,false); }catch(e){} return; }
+    this.mem[k]=v;
+  }
+};
+
 async function loadVault(){
-  try{ const r=await window.storage.get('deepfall:vault',false);
-    if(r) G.vault=Object.assign({},G.vault,JSON.parse(r.value)); }catch(e){}
+  try{ const r=await VAULT.get('deepfall:vault');
+    if(r) G.vault=Object.assign({},G.vault,JSON.parse(r)); }catch(e){}
   // migrate older saves that predate the store
   if(!Array.isArray(G.vault.owned)) G.vault.owned=['w_d','s_d','c_d'];
   if(!G.vault.eq) G.vault.eq={w:'w_d',s:'s_d',c:'c_d'};
@@ -2451,7 +2701,7 @@ async function loadVault(){
     `${sh?sh.name:'—'} / ${w?w.name:'—'}`;
 }
 async function saveVault(){
-  try{ await window.storage.set('deepfall:vault',JSON.stringify(G.vault),false); }catch(e){}
+  try{ await VAULT.set('deepfall:vault',JSON.stringify(G.vault)); }catch(e){}
 }
 
 /* ============================================================
@@ -2921,11 +3171,13 @@ $('swatches').onclick=e=>{ if(!e.target.dataset.c)return;
 
 $('b-host').onclick=async()=>{
   G.me.name=($('name').value||'RAIDER').toUpperCase().slice(0,9);
-  if(!G.storageOK){ toastMenu('No storage bridge — use Fly solo, or open this as a published artifact.'); return; }
+  if(NETB.mode==='none'){ toastMenu(netHelp()); return; }
   G.code=code4(); G.host=true; G.solo=false; G.seed=hashStr(G.code);
   NET.on=true; G.phase='LOBBY';
-  await sSet(K('world'),{t:Date.now(),phase:'LOBBY',seed:G.seed,clock:480,ended:false,
-    players:[mySnapshot()],ai:[],dep:[],loot:[]});
+  const w0={t:Date.now(),phase:'LOBBY',seed:G.seed,clock:480,ended:false,
+    players:[mySnapshot()],ai:[],dep:[],loot:[]};
+  if(NETB.mode==='api'){ try{ await api({code:G.code,op:'world',data:w0}); }catch(e){} }
+  else await sSet(K('world'),w0);
   await netPush();
   $('lcode').textContent=G.code; show('s-lobby');
 };
@@ -2933,9 +3185,11 @@ $('b-join').onclick=async()=>{
   G.me.name=($('name').value||'RAIDER').toUpperCase().slice(0,9);
   const c=($('code').value||'').toUpperCase().trim();
   if(c.length!==4){ toastMenu('Enter the 4-character sector code.'); return; }
-  if(!G.storageOK){ toastMenu('No storage bridge — use Fly solo, or open this as a published artifact.'); return; }
+  if(NETB.mode==='none'){ toastMenu(netHelp()); return; }
   G.code=c; G.host=false; G.solo=false; NET.on=true; G.phase='LOBBY';
-  const w=await sGet(K('world'));
+  let w=null;
+  if(NETB.mode==='api'){ try{ w=(await api({code:G.code,op:'wget'})).world; }catch(e){} }
+  else w=await sGet(K('world'));
   if(!w){ toastMenu('No sector found with that code.'); NET.on=false; return; }
   G.seed=w.seed; await netPush();
   $('lcode').textContent=G.code; $('b-launch').style.display='none'; show('s-lobby');
@@ -2945,7 +3199,7 @@ $('b-solo').onclick=()=>{
   G.solo=true; G.host=true; NET.on=false; G.code=null; G.seed=hashStr(''+Date.now());
   startRun(true);
 };
-$('b-leave').onclick=()=>{NET.on=false;G.phase='MENU';show('s-menu');};
+$('b-leave').onclick=()=>{NET.on=false;p2pClose();G.phase='MENU';show('s-menu');};
 $('b-launch').onclick=()=>startRun(true);
 $('leave').onclick=()=>{
   if(!G.canLeave||G.phase!=='RUN') return;
@@ -2955,8 +3209,14 @@ $('leave').onclick=()=>{
   if(NET.on) netPush();
   endRun(true);
 };
-$('b-again').onclick=()=>{NET.on=false;G.phase='MENU';show('s-menu');loadVault();};
+$('b-again').onclick=()=>{NET.on=false;p2pClose();G.phase='MENU';show('s-menu');loadVault();};
 function toastMenu(m){const w=$('warn');w.style.display='block';w.textContent=m;}
+function netHelp(){
+  if(NETB.err) return 'Multiplayer unavailable — '+NETB.err+
+    '. Add an Upstash Redis (or Vercel KV) store in the Vercel dashboard and redeploy.';
+  return 'Multiplayer unavailable here — no /api/room route and no artifact storage. '+
+    'Fly solo works. Deploy to Vercel with api/room.js and a KV store bound.';
+}
 
 function startRun(asHost){
   G.phase='RUN'; G.ended=false; G.clock=480;
@@ -2967,7 +3227,7 @@ function startRun(asHost){
   G.depleted=new Set(); G.looted=new Set(); terrain=null; aliens=[]; shelters=[]; G.surfBody=null;
   G.canLeave=false; $('leave').style.display='none';
   G.msl.length=0; G.lock=null; specIdx=0; exitSpectate(); G.entry.t=0; G.ascend.t=0;
-  wxSlot=-1; wxWarned=false; wxHurtCool=0;
+  wxSlot=-1; wxWarned=false; wxHurtCool=0; P2P.lastWorldKV=0; NET.lastBuilt=null;
   WX.type='CLEAR'; WX.sev=0; WX.warn=0; $('wx').style.display='none';
   G.camMode={ship:'chase',eva:'third'};
   buildSector(G.seed);
@@ -3022,13 +3282,16 @@ function frameBody(now,xrframe){
     // sim keeps running so the crew's sector stays alive
     pollExtra(); TAP.msl=false; TAP.cam=false;
     stepShots(dt); stepMissiles(dt); stepAI(dt); stepSpectate(dt);
+    const lerpK = p2pLive()?11:6;   // 20Hz peer feed tolerates a tighter follow
     for(const id in G.remotes){const r=G.remotes[id];
-      r.mesh.position.lerp(r.tp,clamp(dt*6,0,1));
-      r.mesh.quaternion.slerp(r.tq,clamp(dt*6,0,1));}
+      r.mesh.position.lerp(r.tp,clamp(dt*lerpK,0,1));
+      r.mesh.quaternion.slerp(r.tq,clamp(dt*lerpK,0,1));}
     if(G.host){ G.clock-=dt; if(G.clock<=0&&!G.ended){G.clock=0;endRun(false);} }
     if(NET.on){
       const t=performance.now();
-      if(t-NET.tPull>200){NET.tPull=t; G.host?netHostTick():netPullClient();}
+      if(t-NET.tP2P>P2P_MS){ NET.tP2P=t; p2pTick(); }
+      if(t-NET.tPull>(p2pLive()?1500:NET_MS)){NET.tPull=t; G.host?netHostTick():netPullClient();}
+      if(t-P2P.tSig>1400){ P2P.tSig=t; if(G.host) p2pHostPoll(); }
     }
     applyView();
     if(inVR()&&now-XR.hudT>160){ XR.hudT=now; updXRHud(); }
@@ -3069,8 +3332,14 @@ function frameBody(now,xrframe){
       const t=performance.now();
       // The host writes itself into the world doc directly. Pushing its own slot
       // too would let netPush() drain the hit queue before netHostTick() reads it.
-      if(!G.host && t-NET.tPush>200){NET.tPush=t; netPush();}
-      if(t-NET.tPull>200){NET.tPull=t; G.host?netHostTick():netPullClient();}
+      // fast lane: peers
+      if(t-NET.tP2P>P2P_MS){ NET.tP2P=t; p2pTick(); }
+      // slow lane: signalling, late joiners, and anyone the NAT defeated
+      const slow = p2pLive() ? 1500 : NET_MS;
+      if(!G.host && t-NET.tPush>slow){NET.tPush=t; netPush();}
+      if(t-NET.tPull>slow){NET.tPull=t; G.host?netHostTick():netPullClient();}
+      if(t-P2P.tSig>1400){ NET.tSigT=P2P.tSig=t;
+        if(G.host) p2pHostPoll(); else { p2pClientConnect(); p2pClientPoll(); } }
     }
   } else if(G.phase==='LOBBY'&&NET.on){
     const t=performance.now();
@@ -3078,7 +3347,11 @@ function frameBody(now,xrframe){
       (G.host?netHostTick():netPullClient()).then?.(()=>{}); netPush();
       const w=NET.world;
       if(w) $('roster').innerHTML=w.players.map(p=>
-        `<div>▸ ${p.name}${p.id===G.me.id?' (you)':''}</div>`).join('');
+        `<div>▸ ${p.name}${p.id===G.me.id?' (you)':''}</div>`).join('')
+        + `<div style="color:var(--ash);margin-top:6px">`
+        + (p2pLive()? 'peer link ready' : 'negotiating peer link…') + `</div>`;
+      if(t-P2P.tSig>1400){ P2P.tSig=t;
+        if(G.host) p2pHostPoll(); else { p2pClientConnect(); p2pClientPoll(); } }
     }
   }
   applyView();
@@ -3087,18 +3360,18 @@ function frameBody(now,xrframe){
 
 /* boot */
 (async function boot(){
-  G.storageOK = !!(window.storage && typeof window.storage.get==='function');
-  if(!G.storageOK){
-    toastMenu('Storage bridge unavailable in this preview. Multiplayer and the vault need a chat artifact or a published link. Solo works fine here.');
-  } else {
-    // probe: the stub exposes the API but silently fails, so write-then-read
-    try{ await window.storage.set('deepfall:probe','1',false);
-      const r=await window.storage.get('deepfall:probe',false);
-      if(!r||r.value!=='1') throw 0;
-    }catch(e){ G.storageOK=false;
-      toastMenu('Storage bridge is a stub here. Multiplayer and the vault need a chat artifact or a published link. Solo works fine.'); }
-  }
-  if(G.storageOK) loadVault();
+  await VAULT.init();
+  await probeBackend();
+  G.storageOK = (NETB.mode!=='none');
+  const vaultWord = VAULT.mode==='local' ? 'saved in this browser'
+                  : VAULT.mode==='artifact' ? 'saved to artifact storage'
+                  : 'not saved — resets on reload';
+  const netWord = NETB.mode==='api' ? 'multiplayer via Vercel KV'
+                : NETB.mode==='artifact' ? 'multiplayer via artifact storage'
+                : 'solo only';
+  if(NETB.mode==='none') toastMenu(netHelp());
+  $('netdiag').textContent='Progress '+vaultWord+' · '+netWord;
+  loadVault();
   buildXRHud();
   buildViewGun();
   buildHands();
