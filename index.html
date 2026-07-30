@@ -97,6 +97,11 @@ input{font-family:var(--mono);font-size:16px;letter-spacing:.2em;text-transform:
 #lookzone{position:absolute;right:0;top:0;width:50%;height:70%;pointer-events:auto}
 
 /* ---------- lock-on ---------- */
+#wx{position:absolute;left:50%;top:calc(env(safe-area-inset-top,0px) + 62px);
+  transform:translateX(-50%);display:none;padding:6px 13px;text-align:center;
+  font-size:10px;letter-spacing:.17em;text-transform:uppercase;min-width:168px}
+#wx .sev{height:4px;background:#0f0d24;margin-top:5px}
+#wx .sev i{display:block;height:100%;width:0;transition:width .2s linear}
 #lock{position:absolute;left:50%;top:50%;transform:translate(-50%,24px);display:none;
   font-size:10px;letter-spacing:.14em;color:var(--flare);white-space:nowrap;
   text-shadow:0 2px 8px #000}
@@ -116,7 +121,7 @@ input{font-family:var(--mono);font-size:16px;letter-spacing:.2em;text-transform:
 #specname{font-size:11px;letter-spacing:.1em;color:var(--coolant);white-space:nowrap}
 #spec button{padding:9px 12px;font-size:10px}
 body.spec #stick,body.spec #pads,body.spec #vitals,body.spec #reticle,
-body.spec #lock,body.spec #prompt,body.spec #leave{display:none!important}
+body.spec #lock,body.spec #prompt,body.spec #leave,body.spec #wx{display:none!important}
 
 /* ---------- debrief ---------- */
 #board{width:100%;max-width:360px;font-size:12px}
@@ -223,6 +228,7 @@ body.spec #lock,body.spec #prompt,body.spec #leave{display:none!important}
     <button class="ghost" id="b-specnext">Next</button>
     <button id="b-specclose">Close sector</button>
   </div>
+  <div id="wx" class="panel"><span id="wxname"></span><div class="sev"><i id="wxbar"></i></div></div>
   <div id="prompt"></div>
   <div id="toast"></div>
   <div id="lookzone"></div>
@@ -575,19 +581,19 @@ function buildSector(seed){
         opacity:opt.halo===undefined?.14:opt.halo,side:T.BackSide,depthWrite:false}));
     halo.position.copy(pos); R.SPACE.add(halo);
     const b={id,obj:m,halo,pos:pos.clone(),r:rad,hue,seed:bseed,
-      relief:opt.relief||1, alienN:opt.alienN||13, xen:opt.xen||.2,
+      relief:opt.relief||1, alienN:opt.alienN||13, xen:opt.xen||.2, harsh:!!opt.harsh,
       spin:(rng()-.5)*.06, name:opt.name||id};
     G.bodies.push(b);
     return b;
   }
   const hue=rng();
   G.planet=makeBody('P',new T.Vector3(0,-120,-620),220,hue,(seed^0x9e37)>>>0,
-    {relief:1, alienN:13, xen:.2, name:'PLANET'});
+    {relief:1, alienN:13, xen:.2, name:'PLANET', harsh:false});
   // A cratered moon, offset from the planet and nestled in the belt. Static
   // rather than orbiting: a moving body would sweep through the asteroid field
   // and there would be no way to statically clear rocks out of its path.
   G.moon=makeBody('M',new T.Vector3(380,90,-430),82,(hue+.42)%1,(seed^0x2b1f)>>>0,
-    {relief:.5, alienN:8, xen:.5, sat:.16, lum:.46, seg:20, halo:.07, name:'MOON'});
+    {relief:.5, alienN:8, xen:.5, sat:.16, lum:.46, seg:20, halo:.07, name:'MOON', harsh:true});
 
   // extraction gate
   const gate=cel(new T.TorusGeometry(26,4,8,16),0x5ce1d0,{emis:.55,thick:.5});
@@ -855,6 +861,135 @@ function stepAliens(dt){
   }
 }
 function killAlienSilent(a){ a.dead=true; a.hp=0; a.obj.visible=false; }
+
+/* ============================================================
+   8c. WEATHER
+       Derived purely from the sector clock and the body seed, so every
+       client computes identical weather with no sync at all. The ship
+       is the only shelter — being inside it is what keeps you alive.
+   ============================================================ */
+const W_PERIOD=95;                 // seconds per weather slot
+let wxPts=null, wxTint=null, wxSlot=-1, wxWarned=false;
+const WX={type:'CLEAR',sev:0,warn:0};
+
+function weatherNow(){
+  const body=G.surfBody;
+  if(!body||G.phase!=='RUN') return {type:'CLEAR',sev:0,warn:0,slot:-1};
+  const t=Math.max(0,480-G.clock);
+  const slot=Math.floor(t/W_PERIOD), u=(t%W_PERIOD)/W_PERIOD;
+  const rr=mulberry32((body.seed ^ (slot*2654435761)) >>> 0);
+  const roll=rr();
+  const pClear = body.harsh ? .34 : .58;   // airless bodies swing harder
+  if(roll<pClear) return {type:'CLEAR',sev:0,warn:0,slot};
+  const type = rr()<.5 ? 'HEAT' : 'COLD';
+  // envelope: warning, ramp, peak, fade
+  let sev=0, warn=0;
+  if(u<.18){ warn=(.18-u)*W_PERIOD; }
+  else if(u<.30) sev=(u-.18)/.12;
+  else if(u<.78) sev=1;
+  else sev=Math.max(0,1-(u-.78)/.22);
+  return {type,sev,warn,slot};
+}
+function wxLabel(t,body){
+  if(t==='CLEAR') return 'Clear';
+  if(t==='HEAT') return body&&body.harsh ? 'Solar exposure' : 'Heat surge';
+  return body&&body.harsh ? 'Deep cold' : 'Cold snap';
+}
+function buildWeatherFX(){
+  const n=430, arr=new Float32Array(n*3);
+  for(let i=0;i<n;i++){
+    arr[i*3]  =(Math.random()-.5)*300;
+    arr[i*3+1]= Math.random()*150;
+    arr[i*3+2]=(Math.random()-.5)*300;
+  }
+  const g=new T.BufferGeometry();
+  g.setAttribute('position',new T.Float32BufferAttribute(arr,3));
+  wxPts=new T.Points(g,new T.PointsMaterial({size:1.7,color:0xffffff,
+    transparent:true,opacity:.85,depthWrite:false}));
+  wxPts.frustumCulled=false; wxPts.visible=false; scene.add(wxPts);
+  // tint shell rides with the player and colours everything inside it
+  wxTint=new T.Mesh(new T.SphereGeometry(760,16,12),
+    new T.MeshBasicMaterial({color:0xffffff,transparent:true,opacity:0,
+      side:T.BackSide,depthWrite:false}));
+  wxTint.frustumCulled=false; wxTint.visible=false; scene.add(wxTint);
+}
+function stepWeather(dt){
+  const onSurface = (G.ctx==='SURFACE'||G.ctx==='EVA');
+  if(!onSurface){
+    if(wxPts) wxPts.visible=false;
+    if(wxTint) wxTint.visible=false;
+    $('wx').style.display='none';
+    WX.type='CLEAR'; WX.sev=0; WX.warn=0;
+    return;
+  }
+  const w=weatherNow();
+  const body=G.surfBody;
+  if(w.slot!==wxSlot){ wxSlot=w.slot; wxWarned=false; }
+  WX.type=w.type; WX.sev=w.sev; WX.warn=w.warn;
+
+  const here = (G.ctx==='EVA') ? G.eva.pos : G.ship.pos;
+  const hot  = (w.type==='HEAT');
+
+  // Inside the hull the suit repairs. Without this, sheltering only paused the
+  // damage and a single bad front would strand you at 3hp for the whole run.
+  if(G.ctx==='SURFACE' && G.eva.hull<70){
+    G.eva.hull=Math.min(70,G.eva.hull+9*dt);
+  }
+
+  // fx
+  if(w.type==='CLEAR'){
+    wxPts.visible=false; wxTint.visible=false;
+  } else {
+    const dens=Math.max(w.sev, w.warn>0?.18:0);
+    wxPts.visible=dens>.02;
+    wxPts.position.set(here.x,here.y-40,here.z);
+    wxPts.material.color.setHex(hot?0xff9a4a:0xdaeeff);
+    wxPts.material.opacity=.25+dens*.6;
+    wxPts.material.size=hot?1.4:2.0;
+    const arr=wxPts.geometry.attributes.position.array;
+    const vy=(hot? 26 : -34)*(0.4+dens);
+    const drift=(hot?4:14)*dens;
+    for(let i=0;i<arr.length;i+=3){
+      arr[i+1]+=vy*dt;
+      arr[i]  +=drift*dt;
+      if(arr[i+1]>150) arr[i+1]=0;
+      if(arr[i+1]<0)   arr[i+1]=150;
+      if(arr[i]>150)   arr[i]-=300;
+    }
+    wxPts.geometry.attributes.position.needsUpdate=true;
+
+    wxTint.visible=w.sev>.01;
+    wxTint.position.copy(here);
+    wxTint.material.color.setHex(hot?0x8c2f10:0x24508f);
+    wxTint.material.opacity=w.sev*.34;
+  }
+
+  // damage — only outside the hull
+  if(w.sev>0 && G.ctx==='EVA'){
+    const dps=(body&&body.harsh?8.5:6.2)*w.sev;
+    damageEVA(dps*dt);
+  }
+
+  // warnings
+  if(w.type!=='CLEAR' && !wxWarned && w.warn>0){
+    wxWarned=true;
+    toast(wxLabel(w.type,body).toUpperCase()+' inbound — get to your ship');
+  }
+
+  // readout
+  const el=$('wx'); el.style.display='block';
+  const col = w.type==='CLEAR' ? 'var(--coolant)' : (hot?'var(--flare)':'#9fd4ff');
+  let txt=wxLabel(w.type,body);
+  if(w.type!=='CLEAR'){
+    if(w.warn>0) txt += ' in '+Math.ceil(w.warn)+'s';
+    else if(G.ctx==='EVA') txt += ' — exposed';
+    else txt += ' — sheltered '+Math.round(G.eva.hull/70*100)+'%';
+  }
+  $('wxname').textContent=txt;
+  $('wxname').style.color=col;
+  $('wxbar').style.width=(w.sev*100)+'%';
+  $('wxbar').style.background=col;
+}
 
 /* ============================================================
    9. DERELICT INTERIOR (on-foot — the only place you leave the ship)
@@ -1134,10 +1269,18 @@ function stepShots(dt){
     if(hit||s.life<=0){ (s.root||R.SPACE).remove(s.m); G.shots.splice(i,1); }
   }
 }
+let wxHurtCool=0;
 function damageEVA(d){
   const e=G.eva;
   if(G.ctx!=='EVA') return;
   e.hull-=d;
+  if(WX && WX.sev>0 && e.hull>0){
+    wxHurtCool-=d;
+    if(wxHurtCool<=0){
+      wxHurtCool=14;
+      toast(WX.type==='HEAT'?'Suit overheating':'Suit freezing');
+    }
+  }
   if(e.hull<=0){
     e.hull=0;
     toast('Suit breach — cargo lost, hauled back to orbit');
@@ -2527,6 +2670,13 @@ function updXRHud(){
   }
   if(G.lock){ g.fillStyle='#ff5f3d'; g.font='700 16px monospace';
     g.fillText('LOCK '+G.lock.name+' '+Math.round(G.lock.dist)+'m',16,158); }
+  else if(WX && WX.type!=='CLEAR'){
+    g.fillStyle = WX.type==='HEAT' ? '#ff8a4a' : '#9fd4ff';
+    g.font='700 16px monospace';
+    const lbl=wxLabel(WX.type,G.surfBody).toUpperCase();
+    g.fillText(WX.warn>0 ? lbl+' IN '+Math.ceil(WX.warn)+'S'
+      : lbl+(G.ctx==='EVA'?' — EXPOSED':' — SHELTERED'),16,158);
+  }
   xrTex.needsUpdate=true;
 }
 
@@ -2615,6 +2765,8 @@ function startRun(asHost){
   G.depleted=new Set(); G.looted=new Set(); terrain=null; aliens=[]; G.surfBody=null;
   G.canLeave=false; $('leave').style.display='none';
   G.msl.length=0; G.lock=null; specIdx=0; exitSpectate(); G.entry.t=0; G.ascend.t=0;
+  wxSlot=-1; wxWarned=false; wxHurtCool=0;
+  WX.type='CLEAR'; WX.sev=0; WX.warn=0; $('wx').style.display='none';
   G.camMode={ship:'chase',eva:'third'};
   buildSector(G.seed);
   if(G.host) spawnAI(4); else G.ai=[];
@@ -2688,6 +2840,7 @@ function frameBody(now,xrframe){
     stepShots(dt);
     stepGunFlash(dt);
     stepBodies(dt);
+    stepWeather(dt);
     stepMissiles(dt);
     stepAliens(dt);
     stepAI(dt);
@@ -2742,6 +2895,7 @@ function frameBody(now,xrframe){
   buildXRHud();
   buildViewGun();
   buildHands();
+  buildWeatherFX();
   renderer.setAnimationLoop(frame);
 })();
 })();
