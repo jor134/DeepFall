@@ -10,8 +10,57 @@
 // which is the entire reason this route exists instead of calling the store
 // straight from the browser.
 
-const STORE_URL   = process.env.KV_REST_API_URL   || process.env.UPSTASH_REDIS_REST_URL;
-const STORE_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
+// Credentials are discovered rather than hardcoded. Vercel lets you attach a
+// marketplace resource with an arbitrary env-var prefix
+// (`vercel integration resource connect <db> --prefix FOO_`), and Upstash and
+// the legacy Vercel KV integration use different names again. Scanning for the
+// suffix pair means this works whatever the store ended up called.
+const URL_SUFFIXES = ['REST_API_URL', 'REST_URL'];
+const TOK_SUFFIXES = ['REST_API_TOKEN', 'REST_TOKEN'];
+
+function stripSuffix(key, suffixes) {
+  for (const suf of suffixes) {
+    if (key.endsWith(suf)) return key.slice(0, key.length - suf.length);
+  }
+  return null;
+}
+
+function discoverStore() {
+  const env = process.env;
+  const urls = [], toks = [];
+  for (const k of Object.keys(env)) {
+    const v = env[k];
+    if (!v) continue;
+    const K = k.toUpperCase();
+    // must be an HTTPS REST endpoint; a redis:// TCP string is no use to fetch
+    if (stripSuffix(K, URL_SUFFIXES) !== null && /^https:\/\//.test(v)) {
+      urls.push({ key: k, prefix: stripSuffix(K, URL_SUFFIXES), value: v });
+    }
+    if (stripSuffix(K, TOK_SUFFIXES) !== null) {
+      toks.push({ key: k, prefix: stripSuffix(K, TOK_SUFFIXES), value: v });
+    }
+  }
+  // prefer a URL and token that share a prefix — that is one resource
+  for (const u of urls) {
+    const t = toks.find(x => x.prefix === u.prefix);
+    if (t) return { url: u.value, token: t.value, urlVar: u.key, tokenVar: t.key };
+  }
+  // otherwise, if there is exactly one of each, they must belong together
+  if (urls.length === 1 && toks.length === 1) {
+    return {
+      url: urls[0].value, token: toks[0].value,
+      urlVar: urls[0].key, tokenVar: toks[0].key
+    };
+  }
+  return {
+    url: null, token: null, urlVar: null, tokenVar: null,
+    seenUrls: urls.map(u => u.key), seenToks: toks.map(t => t.key)
+  };
+}
+
+const STORE = discoverStore();
+const STORE_URL = STORE.url;
+const STORE_TOKEN = STORE.token;
 
 const TTL = 1800;              // rooms evaporate 30 min after the last write
 const SIG_TTL = 300;           // handshakes are short-lived by nature
@@ -36,14 +85,25 @@ export default async function handler(req, res) {
 
   // GET is the capability probe the client runs at boot.
   if (req.method === 'GET') {
+    // Names only. Never echo a credential value, even to help debugging.
     return res.status(200).json({
       ok: !!(STORE_URL && STORE_TOKEN),
-      backend: 'vercel-kv'
+      backend: 'redis-rest',
+      urlVar: STORE.urlVar || null,
+      tokenVar: STORE.tokenVar || null,
+      candidates: STORE.url ? undefined
+        : { urlLike: STORE.seenUrls || [], tokenLike: STORE.seenToks || [] }
     });
   }
   if (req.method !== 'POST') return res.status(405).json({ error: 'method' });
   if (!STORE_URL || !STORE_TOKEN) {
-    return res.status(503).json({ error: 'no store bound to this project' });
+    return res.status(503).json({
+      error: 'no Redis REST credentials found in the environment',
+      hint: 'Connect an Upstash Redis store to this project and redeploy. '
+          + 'If the store is Neon (Postgres) rather than Redis, this route '
+          + 'cannot talk to it.',
+      urlLike: STORE.seenUrls || [], tokenLike: STORE.seenToks || []
+    });
   }
 
   let b = req.body;
